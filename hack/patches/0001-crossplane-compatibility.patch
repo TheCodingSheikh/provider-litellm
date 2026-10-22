@@ -10,8 +10,9 @@ Rebased onto v2.1.0; none of these were fixed in that release.
    LiteLLM answers with a 307 the provider refuses to follow).
 2. Budget and Tag absence classified as not-found rather than a hard error,
    including LiteLLM's 404-inside-a-500 tag response.
-3. litellm_key.organization_id marked Computed, since LiteLLM derives it
-   from the team and returns it even when the configuration is null.
+3. litellm_key.organization_id marked Computed, since LiteLLM derives it from
+   the team. Reads that omit it for keys without an organization resolve the
+   computed value to known null instead of leaving it unknown after apply.
 4. Nested agent_card fields (signatures, skills[].security_json) no longer
    marked sensitive: they are published agent-card content rather than key
    material, and a sensitive path nested under agent_card cannot be resolved
@@ -876,3 +877,64 @@ index 2fae7a7..02a56c8 100644
  	if resp.Diagnostics.HasError() {
  		return
  	}
+
+--- a/internal/provider/resource_key.go
++++ b/internal/provider/resource_key.go
+@@ -1684,6 +1684,10 @@
+ 	}
+ 	if orgID, ok := info["organization_id"].(string); ok && orgID != "" {
+ 		data.OrganizationID = types.StringValue(orgID)
++	} else {
++		// LiteLLM omits organization_id for keys without an organization.
++		// Clear stale state too, or root-scoped keys keep sending an invalid organization.
++		data.OrganizationID = types.StringNull()
+ 	}
+ 	if projectID, ok := info["project_id"].(string); ok && projectID != "" {
+ 		data.ProjectID = types.StringValue(projectID)
+--- a/internal/provider/resource_key_test.go
++++ b/internal/provider/resource_key_test.go
+@@ -660,0 +661,44 @@
++
++func TestReadKeyClearsOrganizationIDWhenAPIOmitsIt(t *testing.T) {
++	t.Parallel()
++
++	for _, testCase := range []struct {
++		name           string
++		organizationID types.String
++	}{
++		{name: "unknown", organizationID: types.StringUnknown()},
++		{name: "stale value", organizationID: types.StringValue("ducktape")},
++	} {
++		t.Run(testCase.name, func(t *testing.T) {
++			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				w.Header().Set("Content-Type", "application/json")
++				_ = json.NewEncoder(w).Encode(map[string]interface{}{
++					"key":  "key-123",
++					"info": map[string]interface{}{"key": "key-123"},
++				})
++			}))
++			defer server.Close()
++
++			r := &KeyResource{
++				client: &Client{
++					APIBase:    server.URL,
++					APIKey:     "test-key",
++					HTTPClient: server.Client(),
++				},
++			}
++
++			data := KeyResourceModel{
++				ID:             types.StringValue("key-123"),
++				Key:            types.StringValue("key-123"),
++				OrganizationID: testCase.organizationID,
++			}
++
++			if err := r.readKey(context.Background(), &data); err != nil {
++				t.Fatalf("readKey returned error: %v", err)
++			}
++			if !data.OrganizationID.IsNull() {
++				t.Fatalf("organization_id should resolve to null when omitted, got %#v", data.OrganizationID)
++			}
++		})
++	}
++}

@@ -1,0 +1,183 @@
+# Crossplane's generated Terraform configuration resolves key_wo from a Secret
+# reference and includes it in the plan. Since patch 0001 removes Terraform's
+# WriteOnly marker for Upjet compatibility, Create and Update must round-trip
+# that sensitive planned value or Terraform rejects the apply as inconsistent.
+diff --git a/internal/provider/resource_key.go b/internal/provider/resource_key.go
+index fce99c9..f123abc 100644
+--- a/internal/provider/resource_key.go
++++ b/internal/provider/resource_key.go
+@@ -698,7 +698,7 @@
+ 	if writeOnlyMode {
+ 		data.ID = types.StringValue(hashKeyForID(writeOnlyKey.ValueString()))
+ 		data.Key = types.StringNull()
+-		data.KeyWO = types.StringNull()
++		// Crossplane resolved key_wo from a Secret ref; keep the planned value in state.
+ 	} else if keyVal, ok := result["key"].(string); ok {
+ 		data.Key = types.StringValue(keyVal)
+ 		data.ID = types.StringValue(hashKeyForID(keyVal))
+@@ -952,6 +951,6 @@
+ 	data.ID = state.ID
+ 	data.Key = state.Key
+-	data.KeyWO = types.StringNull()
++	// Crossplane resolves key_wo from a Secret ref, so preserve its planned value.
+ 	data.MetadataJSON = config.MetadataJSON
+ 	data.ConfigJSON = config.ConfigJSON
+ 	data.PermissionsJSON = config.PermissionsJSON
+diff --git a/internal/provider/key_wo_crossplane_protocol_test.go b/internal/provider/key_wo_crossplane_protocol_test.go
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/internal/provider/key_wo_crossplane_protocol_test.go
+@@ -0,0 +1,152 @@
++package provider
++
++import (
++	"context"
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"sync/atomic"
++	"testing"
++
++	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
++	"github.com/hashicorp/terraform-plugin-go/tftypes"
++)
++
++func keyWOCrossplaneProtocolServer(t *testing.T, rawKey string, currentAlias *string, creates, updates *atomic.Int64) *httptest.Server {
++	t.Helper()
++	hash, err := keyHashFromID(hashKeyForID(rawKey))
++	if err != nil {
++		t.Fatal(err)
++	}
++	return httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
++		writer.Header().Set("Content-Type", "application/json")
++		switch {
++		case request.Method == http.MethodPost && request.URL.Path == "/key/generate":
++			creates.Add(1)
++			var body map[string]interface{}
++			if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
++				t.Errorf("decode generate body: %v", err)
++				writer.WriteHeader(http.StatusBadRequest)
++				return
++			}
++			if body["key"] != rawKey {
++				t.Errorf("generated key = %#v, want configured key", body["key"])
++			}
++			if alias, ok := body["key_alias"].(string); ok {
++				*currentAlias = alias
++			}
++			_ = json.NewEncoder(writer).Encode(map[string]string{"key": rawKey})
++		case request.Method == http.MethodPost && request.URL.Path == "/key/update":
++			updates.Add(1)
++			var body map[string]interface{}
++			if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
++				t.Errorf("decode update body: %v", err)
++				writer.WriteHeader(http.StatusBadRequest)
++				return
++			}
++			if body["key"] != hash {
++				t.Errorf("update identity = %#v, want hash", body["key"])
++			}
++			if alias, ok := body["key_alias"].(string); ok {
++				*currentAlias = alias
++			}
++			_ = json.NewEncoder(writer).Encode(map[string]interface{}{})
++		case request.Method == http.MethodGet && request.URL.Path == "/key/info":
++			if request.URL.Query().Get("key") != hash {
++				t.Errorf("read identity = %q, want hash", request.URL.Query().Get("key"))
++			}
++			_ = json.NewEncoder(writer).Encode(map[string]interface{}{
++				"key": hash,
++				"info": map[string]interface{}{
++					"token": hash, "key_alias": *currentAlias, "models": []string{},
++				},
++			})
++		default:
++			http.NotFound(writer, request)
++		}
++	}))
++}
++
++func keyWOCrossplaneProtocolValues(t *testing.T, schema *tfprotov6.Schema, values map[string]interface{}) *tfprotov6.DynamicValue {
++	t.Helper()
++	return accessGroupProtocolDynamicValue(t, schema, organizationProjectProtocolValue(t, schema, values))
++}
++
++func keyWOCrossplaneAssertState(t *testing.T, schema *tfprotov6.Schema, state *tfprotov6.DynamicValue, rawKey string) {
++	t.Helper()
++	attributes := protocolAttributeMap(t, schema, state)
++	var actual string
++	if err := attributes["key_wo"].As(&actual); err != nil || actual != rawKey {
++		t.Fatalf("key_wo state = %q, err=%v; want configured sensitive value", actual, err)
++	}
++}
++
++func TestKeyWriteOnlyCrossplaneCreateRetainsPlannedValueProtocol(t *testing.T) {
++	ctx := context.Background()
++	const rawKey = "sk-crossplane-create-test"
++	currentAlias := ""
++	var creates, updates atomic.Int64
++	server := keyWOCrossplaneProtocolServer(t, rawKey, &currentAlias, &creates, &updates)
++	defer server.Close()
++
++	protocolServer, schemas := configuredImportProtocolServer(t, ctx, server.URL)
++	schema := schemas.ResourceSchemas["litellm_key"]
++	values := map[string]interface{}{"key_wo": rawKey, "key_wo_version": "1", "key_alias": "created"}
++	config := keyWOCrossplaneProtocolValues(t, schema, values)
++	nullState := accessGroupProtocolDynamicValue(t, schema, tftypes.NewValue(schema.ValueType(), nil))
++	planned, err := protocolServer.PlanResourceChange(ctx, &tfprotov6.PlanResourceChangeRequest{
++		TypeName: "litellm_key", Config: config, PriorState: nullState,
++		ProposedNewState: keySemanticCreateProposed(t, schema, values),
++	})
++	if err != nil || accessGroupProtocolDiagnosticsHaveError(planned.Diagnostics) {
++		t.Fatalf("create plan: err=%v diagnostics=%s", err, agentProtocolDiagnosticsText(planned.Diagnostics))
++	}
++	applied, err := protocolServer.ApplyResourceChange(ctx, &tfprotov6.ApplyResourceChangeRequest{
++		TypeName: "litellm_key", Config: config, PriorState: nullState,
++		PlannedState: planned.PlannedState, PlannedPrivate: planned.PlannedPrivate,
++	})
++	if err != nil || accessGroupProtocolDiagnosticsHaveError(applied.Diagnostics) {
++		t.Fatalf("create apply: err=%v diagnostics=%s", err, agentProtocolDiagnosticsText(applied.Diagnostics))
++	}
++	keyWOCrossplaneAssertState(t, schema, applied.NewState, rawKey)
++	if creates.Load() != 1 || updates.Load() != 0 {
++		t.Fatalf("creates=%d updates=%d, want one create and no updates", creates.Load(), updates.Load())
++	}
++}
++
++func TestKeyWriteOnlyCrossplaneUpdateRetainsPlannedValueProtocol(t *testing.T) {
++	ctx := context.Background()
++	const rawKey = "sk-crossplane-update-test"
++	managementID := hashKeyForID(rawKey)
++	currentAlias := "before"
++	var creates, updates atomic.Int64
++	server := keyWOCrossplaneProtocolServer(t, rawKey, &currentAlias, &creates, &updates)
++	defer server.Close()
++
++	protocolServer, schemas := configuredImportProtocolServer(t, ctx, server.URL)
++	schema := schemas.ResourceSchemas["litellm_key"]
++	prior := keyWOCrossplaneProtocolValues(t, schema, map[string]interface{}{
++		"id": managementID, "key_wo": rawKey, "key_wo_version": "1", "key_alias": "before",
++	})
++	config := keyWOCrossplaneProtocolValues(t, schema, map[string]interface{}{
++		"key_wo": rawKey, "key_wo_version": "1", "key_alias": "after",
++	})
++	proposed := organizationProjectProtocolReplace(t, schema, prior, map[string]interface{}{"key_alias": "after"})
++	planned, err := protocolServer.PlanResourceChange(ctx, &tfprotov6.PlanResourceChangeRequest{
++		TypeName: "litellm_key", Config: config, PriorState: prior, ProposedNewState: proposed,
++	})
++	if err != nil || accessGroupProtocolDiagnosticsHaveError(planned.Diagnostics) {
++		t.Fatalf("update plan: err=%v diagnostics=%s", err, agentProtocolDiagnosticsText(planned.Diagnostics))
++	}
++	applied, err := protocolServer.ApplyResourceChange(ctx, &tfprotov6.ApplyResourceChangeRequest{
++		TypeName: "litellm_key", Config: config, PriorState: prior,
++		PlannedState: planned.PlannedState, PlannedPrivate: planned.PlannedPrivate,
++	})
++	if err != nil || accessGroupProtocolDiagnosticsHaveError(applied.Diagnostics) {
++		t.Fatalf("update apply: err=%v diagnostics=%s", err, agentProtocolDiagnosticsText(applied.Diagnostics))
++	}
++	keyWOCrossplaneAssertState(t, schema, applied.NewState, rawKey)
++	if creates.Load() != 0 || updates.Load() != 1 {
++		t.Fatalf("creates=%d updates=%d, want no creates and one update", creates.Load(), updates.Load())
++	}
++}

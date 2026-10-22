@@ -141,13 +141,24 @@ $(TERRAFORM): check-terraform-version
 
 # Build the upstream provider from source for every platform the image needs
 # plus the host, so schema generation and the runtime image share one mirror.
+TERRAFORM_PROVIDER_HOST_PLATFORM := $(HOSTOS)_$(patsubst x86_64,amd64,$(patsubst aarch64,arm64,$(HOSTARCH)))
 terraform-provider: 
 	@$(INFO) building $(TERRAFORM_PROVIDER_SOURCE) from $(TERRAFORM_PROVIDER_REF)
 	@./hack/build-terraform-provider.sh \
 		"$(TERRAFORM_PROVIDER_REPO)" "$(TERRAFORM_PROVIDER_REF)" "$(TERRAFORM_PROVIDER_VERSION)" \
 		"$(TERRAFORM_PROVIDER_SRC)" "$(TERRAFORM_PROVIDER_MIRROR)" \
-		$(HOSTOS)_$(HOSTARCH) $(filter linux_%,$(PLATFORMS)) || $(FAIL)
+		$(TERRAFORM_PROVIDER_HOST_PLATFORM) $(filter-out $(TERRAFORM_PROVIDER_HOST_PLATFORM),$(filter linux_%,$(PLATFORMS))) || $(FAIL)
 	@$(OK) building $(TERRAFORM_PROVIDER_SOURCE) from $(TERRAFORM_PROVIDER_REF)
+
+# Exercise the focused regression test embedded in the Crossplane compatibility
+# patch. The provider wrapper's normal unit tests do not run tests from the
+# Terraform provider source that the runtime image embeds.
+.PHONY: test-terraform-provider-patch
+test-terraform-provider-patch:
+	@./hack/build-terraform-provider.sh \
+		"$(TERRAFORM_PROVIDER_REPO)" "$(TERRAFORM_PROVIDER_REF)" "$(TERRAFORM_PROVIDER_VERSION)" \
+		"$(TERRAFORM_PROVIDER_SRC)" "$(TERRAFORM_PROVIDER_MIRROR)" linux_amd64 || $(FAIL)
+	@cd "$(TERRAFORM_PROVIDER_SRC)" && grep -Fq 'func TestReadKeyClearsOrganizationIDWhenAPIOmitsIt(' internal/provider/resource_key_test.go && grep -Fq 'func TestKeyWriteOnlyCrossplaneUpdateRetainsPlannedValueProtocol(' internal/provider/key_wo_crossplane_protocol_test.go && go test ./internal/provider -run 'TestReadKeyClearsOrganizationIDWhenAPIOmitsIt|TestKeyWriteOnlyCrossplane(Create|Update)RetainsPlannedValueProtocol' -count=1 || $(FAIL)
 
 $(TERRAFORM_PROVIDER_SCHEMA): $(TERRAFORM) terraform-provider
 	@$(INFO) generating provider schema for $(TERRAFORM_PROVIDER_SOURCE) $(TERRAFORM_PROVIDER_VERSION)

@@ -53,14 +53,19 @@ echo "upstream ${REF} at ${SHA}"
 # Local fixes carried on top of upstream. Each patch is a plain `git diff` and
 # is expected to be dropped once the equivalent change lands upstream.
 PATCH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/patches"
-if compgen -G "${PATCH_DIR}/*.patch" >/dev/null; then
-  for patch in "${PATCH_DIR}"/*.patch; do
+PATCHES=()
+for patch in "${PATCH_DIR}"/*.patch; do
+  [ -f "${patch}" ] || continue
+  PATCHES+=("${patch}")
+done
+if [ ${#PATCHES[@]} -gt 0 ]; then
+  for patch in "${PATCHES[@]}"; do
     echo "  applying $(basename "${patch}")"
     git -C "${SRC}" apply --whitespace=nowarn "${patch}"
   done
   # Builds are keyed by upstream SHA plus the patch set, so editing a patch
   # correctly invalidates a previously built binary.
-  SHA="${SHA}-$(cat "${PATCH_DIR}"/*.patch | shasum -a 256 | cut -c1-12)"
+  SHA="${SHA}-$(cat "${PATCHES[@]}" | shasum -a 256 | cut -c1-12)"
 fi
 
 for platform in "${PLATFORMS[@]}"; do
